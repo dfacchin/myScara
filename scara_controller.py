@@ -166,6 +166,13 @@ def compute_crc16(data: bytes) -> int:
     return crc
 
 
+class ControlStrategy(Enum):
+    """Strategia di controllo traiettoria."""
+    MOTION_MODE = "motion_mode"  # 0x400+ID: pos+vel+torque (CAN only, migliore)
+    SPEED = "speed"              # 0xA2: velocità con correzione posizione
+    POSITION = "position"        # 0xA4: posizione assoluta (più semplice, può stutterare)
+
+
 class BusInterface(Enum):
     """Tipo di interfaccia bus."""
     CAN = "can"
@@ -300,6 +307,73 @@ class MotorProtocol:
             return bytes(reply.data)
         return None
 
+    def send_motion_mode(self, motor_id: int, p_des: float, v_des: float,
+                        t_ff: float, kp: float, kd: float,
+                        timeout: float = 0.1) -> Optional[bytes]:
+        """
+        Invia comando Motion Mode Control (0x400 + ID) - solo CAN.
+
+        Controllore impedenza: IqRef = kp*(p_des - p_actual) + kd*(v_des - v_actual) + t_ff
+
+        Args:
+            motor_id: ID motore (1-32)
+            p_des: Posizione desiderata [-12.5, 12.5] rad
+            v_des: Velocità desiderata [-45, 45] rad/s
+            t_ff: Coppia feedforward [-24, 24] N·m
+            kp: Guadagno posizione [0, 500]
+            kd: Guadagno velocità [0, 5]
+
+        Returns:
+            8 byte di risposta o None
+        """
+        if self.bus_type != BusInterface.CAN:
+            raise RuntimeError("Motion Mode disponibile solo su CAN bus")
+
+        # Clamp e normalizza parametri nei range del protocollo
+        p_des = max(-12.5, min(12.5, p_des))
+        v_des = max(-45.0, min(45.0, v_des))
+        t_ff = max(-24.0, min(24.0, t_ff))
+        kp = max(0.0, min(500.0, kp))
+        kd = max(0.0, min(5.0, kd))
+
+        # Converti in valori interi normalizzati
+        p_int = int((p_des - (-12.5)) / 25.0 * 65535)   # 16-bit [0, 65535]
+        v_int = int((v_des - (-45.0)) / 90.0 * 4095)    # 12-bit [0, 4095]
+        t_int = int((t_ff - (-24.0)) / 48.0 * 4095)     # 12-bit [0, 4095]
+        kp_int = int(kp / 500.0 * 4095)                   # 12-bit [0, 4095]
+        kd_int = int(kd / 5.0 * 4095)                     # 12-bit [0, 4095]
+
+        # Pack bit-field (schema dal protocollo sezione 5.2)
+        # DATA[0]: p_des[15:8]
+        # DATA[1]: p_des[7:0]
+        # DATA[2]: v_des[11:4]
+        # DATA[3]: v_des[3:0] | kp[11:8]
+        # DATA[4]: kp[7:0]
+        # DATA[5]: kd[11:4]
+        # DATA[6]: kd[3:0] | t_ff[11:8]
+        # DATA[7]: t_ff[7:0]
+        data = bytes([
+            (p_int >> 8) & 0xFF,
+            p_int & 0xFF,
+            (v_int >> 4) & 0xFF,
+            ((v_int & 0x0F) << 4) | ((kp_int >> 8) & 0x0F),
+            kp_int & 0xFF,
+            (kd_int >> 4) & 0xFF,
+            ((kd_int & 0x0F) << 4) | ((t_int >> 8) & 0x0F),
+            t_int & 0xFF,
+        ])
+
+        import can
+        can_id = 0x400 + motor_id
+        msg = can.Message(arbitration_id=can_id, data=data, is_extended_id=False)
+        self.bus.send(msg)
+
+        # Risposta su 0x500 + ID
+        reply = self.bus.recv(timeout=timeout)
+        if reply and reply.arbitration_id == 0x500 + motor_id:
+            return bytes(reply.data)
+        return None
+
     def _send_rs485(self, motor_id: int, data: bytes,
                     expect_reply: bool, timeout: float) -> Optional[bytes]:
         """Invio via RS485."""
@@ -412,6 +486,31 @@ class V3Motor:
     def system_reset(self):
         """Reset sistema (0x76)."""
         self._send(MotorCommand.SYSTEM_RESET, expect_reply=False)
+
+    # --- Motion Mode Control (0x400+ID) ---
+
+    def motion_mode_control(self, p_des_rad: float, v_des_rad_s: float,
+                            t_ff_nm: float, kp: float = 50.0,
+                            kd: float = 1.0) -> Optional[bytes]:
+        """
+        Controllo Motion Mode (0x400+ID) - impedenza con feedforward.
+
+        IqRef = kp*(p_des - p_actual) + kd*(v_des - v_actual) + t_ff
+
+        Args:
+            p_des_rad: Posizione desiderata output shaft [rad] (range: -12.5 to 12.5)
+            v_des_rad_s: Velocità desiderata output shaft [rad/s] (range: -45 to 45)
+            t_ff_nm: Coppia feedforward [N·m] (range: -24 to 24)
+            kp: Guadagno posizione (0-500)
+            kd: Guadagno velocità (0-5)
+
+        Returns:
+            Risposta dal motore
+        """
+        with self._lock:
+            return self.protocol.send_motion_mode(
+                self.motor_id, p_des_rad, v_des_rad_s, t_ff_nm, kp, kd
+            )
 
     # --- Controllo coppia ---
 
@@ -624,6 +723,28 @@ class SimulatedMotor(V3Motor):
         self.status.timestamp = time.time()
         return bytes(8)
 
+    def motion_mode_control(self, p_des_rad, v_des_rad_s, t_ff_nm,
+                            kp=50.0, kd=1.0):
+        self._current_angle_deg = np.rad2deg(p_des_rad)
+        self.status.angle = int(self._current_angle_deg) % 32768
+        self.status.speed = int(np.rad2deg(v_des_rad_s))
+        self.status.timestamp = time.time()
+        return bytes(8)
+
+    def speed_control(self, speed_dps):
+        self.status.speed = int(speed_dps)
+        # Simula integrazione: angolo cambia con la velocità
+        dt = 0.01  # dt approssimato
+        self._current_angle_deg += speed_dps * dt
+        self.status.angle = int(self._current_angle_deg) % 32768
+        self.status.timestamp = time.time()
+        return bytes(8)
+
+    def torque_control(self, current_a):
+        self.status.torque_current = current_a
+        self.status.timestamp = time.time()
+        return bytes(8)
+
     def shutdown(self): pass
     def stop(self): pass
     def brake_release(self): pass
@@ -641,6 +762,9 @@ class SimulatedMotor(V3Motor):
 @dataclass
 class ControllerConfig:
     """Configurazione del controllore traiettoria."""
+    # Strategia di controllo
+    strategy: ControlStrategy = ControlStrategy.MOTION_MODE
+
     # Frequenza di controllo
     control_rate_hz: float = 100.0     # Hz (intervallo invio comandi)
 
@@ -649,12 +773,19 @@ class ControllerConfig:
     comm_timeout_ms: int = 500            # Timeout comunicazione motore
     max_motor_temp: int = 80              # Temperatura massima motore (°C)
 
-    # Velocità massima per i comandi di posizione
+    # Velocità massima per i comandi di posizione (solo strategy=POSITION)
     max_motor_speed_dps: int = 720   # dps output shaft
 
-    # Accelerazione motore (per planning interno motore)
+    # Accelerazione motore (per planning interno motore, solo strategy=POSITION)
     position_accel_dps2: int = 10000  # dps/s
     position_decel_dps2: int = 10000  # dps/s
+
+    # Guadagni Motion Mode (0x400+ID)
+    motion_kp: float = 50.0     # Guadagno posizione [0-500]
+    motion_kd: float = 1.5      # Guadagno velocità [0-5]
+
+    # Guadagno correzione posizione per strategy=SPEED
+    speed_pos_correction_kp: float = 5.0  # (dps / deg di errore)
 
     # Abilitazioni
     enable_safety_checks: bool = True
@@ -665,12 +796,22 @@ class TrajectoryController:
     """
     Controllore di traiettoria per SCARA 2-DOF con motori X-V3.
 
-    Prende la traiettoria pianificata dal simulatore (angoli giunto nel tempo)
-    e invia i comandi di posizione ai motori alla frequenza di controllo.
+    Prende la traiettoria pianificata dal simulatore e invia comandi ai motori.
 
-    Modalità di controllo:
-    1. Posizione assoluta (0xA4): invia posizioni target lungo la traiettoria
-    2. Il motore V3 gestisce internamente il planning della velocità
+    Strategie di controllo:
+    1. MOTION_MODE (0x400+ID): Impedenza con feedforward pos+vel+coppia (CAN only)
+       - Migliore: il motore riceve posizione, velocità E coppia in un frame
+       - IqRef = kp*(p_des - p_actual) + kd*(v_des - v_actual) + t_ff
+       - Movimento fluido, nessuno stuttering
+
+    2. SPEED (0xA2): Controllo velocità con correzione posizione
+       - Buona: invia velocità pianificata + termine correttivo proporzionale
+       - speed_cmd = qd_planned + Kp * (q_planned - q_actual)
+       - Fluido, funziona su CAN e RS485
+
+    3. POSITION (0xA4): Controllo posizione assoluta
+       - Semplice ma può stutterare: ogni comando è un move-to indipendente
+       - Usare solo come fallback
     """
 
     def __init__(self, motor1: V3Motor, motor2: V3Motor,
@@ -768,6 +909,7 @@ class TrajectoryController:
 
     def execute_trajectory(self, t: np.ndarray, q: np.ndarray,
                           qd: np.ndarray, cart: dict,
+                          tau: np.ndarray = None,
                           blocking: bool = True) -> bool:
         """
         Esegui la traiettoria pianificata sui motori.
@@ -777,6 +919,7 @@ class TrajectoryController:
             q: Array angoli giunti [2, N] in radianti
             qd: Array velocità giunti [2, N] in rad/s
             cart: Dizionario dati cartesiani (dal simulatore)
+            tau: Array coppie [2, N] in N*m (per feedforward, opzionale)
             blocking: Se attendere completamento
 
         Returns:
@@ -786,11 +929,13 @@ class TrajectoryController:
             print("   Sistema in stato di emergenza. Reset necessario.")
             return False
 
+        strategy = self.config.strategy
+
         # Sottocampiona la traiettoria alla frequenza di controllo
         dt_ctrl = 1.0 / self.config.control_rate_hz
         t_ctrl = np.arange(t[0], t[-1], dt_ctrl)
 
-        # Interpola angoli alla frequenza di controllo
+        # Interpola alla frequenza di controllo
         from scipy.interpolate import interp1d
         q1_interp = interp1d(t, q[0], kind='linear', fill_value='extrapolate')
         q2_interp = interp1d(t, q[1], kind='linear', fill_value='extrapolate')
@@ -802,9 +947,26 @@ class TrajectoryController:
         qd1_ctrl = qd1_interp(t_ctrl)
         qd2_ctrl = qd2_interp(t_ctrl)
 
+        # Interpola coppie feedforward (per MOTION_MODE)
+        if tau is not None:
+            tau1_interp = interp1d(t, tau[0], kind='linear', fill_value='extrapolate')
+            tau2_interp = interp1d(t, tau[1], kind='linear', fill_value='extrapolate')
+            tau1_ctrl = tau1_interp(t_ctrl)
+            tau2_ctrl = tau2_interp(t_ctrl)
+        else:
+            tau1_ctrl = np.zeros_like(t_ctrl)
+            tau2_ctrl = np.zeros_like(t_ctrl)
+
         n_points = len(t_ctrl)
 
+        strategy_names = {
+            ControlStrategy.MOTION_MODE: "MOTION MODE (pos+vel+coppia)",
+            ControlStrategy.SPEED: "VELOCITA' (con correzione posizione)",
+            ControlStrategy.POSITION: "POSIZIONE ASSOLUTA (fallback)",
+        }
+
         print(f"\n   Esecuzione traiettoria:")
+        print(f"   Strategia: {strategy_names[strategy]}")
         print(f"   Punti di controllo: {n_points}")
         print(f"   Frequenza: {self.config.control_rate_hz} Hz")
         print(f"   Durata: {t_ctrl[-1]:.2f} s")
@@ -829,30 +991,72 @@ class TrajectoryController:
             while self._running and point_idx < n_points:
                 loop_start = time.time()
 
-                # Calcola angoli target per i motori (da radianti a gradi)
-                q1_deg = np.rad2deg(q1_ctrl[point_idx])
-                q2_deg = np.rad2deg(q2_ctrl[point_idx])
+                # --- Valori pianificati per questo timestep ---
+                q1_rad = q1_ctrl[point_idx]
+                q2_rad = q2_ctrl[point_idx]
+                qd1_rad_s = qd1_ctrl[point_idx]
+                qd2_rad_s = qd2_ctrl[point_idx]
+                tau1_nm = tau1_ctrl[point_idx]
+                tau2_nm = tau2_ctrl[point_idx]
 
-                # Calcola velocità massima per questo passo
-                # (basata sulla velocità giunto pianificata)
-                qd1_dps = abs(np.rad2deg(qd1_ctrl[point_idx]))
-                qd2_dps = abs(np.rad2deg(qd2_ctrl[point_idx]))
+                q1_deg = np.rad2deg(q1_rad)
+                q2_deg = np.rad2deg(q2_rad)
 
-                max_speed1 = max(10, min(int(qd1_dps * 1.5),
-                                         self.config.max_motor_speed_dps))
-                max_speed2 = max(10, min(int(qd2_dps * 1.5),
-                                         self.config.max_motor_speed_dps))
+                # --- Invio comandi secondo la strategia ---
 
-                # Invia comandi di posizione assoluta
-                self.motor1.absolute_position_control(q1_deg, max_speed1)
-                self.motor2.absolute_position_control(q2_deg, max_speed2)
+                if strategy == ControlStrategy.MOTION_MODE:
+                    # Impedenza: pos + vel + coppia feedforward in un frame
+                    # Il motore interpola fluentemente tra i target
+                    self.motor1.motion_mode_control(
+                        p_des_rad=q1_rad,
+                        v_des_rad_s=qd1_rad_s,
+                        t_ff_nm=tau1_nm,
+                        kp=self.config.motion_kp,
+                        kd=self.config.motion_kd
+                    )
+                    self.motor2.motion_mode_control(
+                        p_des_rad=q2_rad,
+                        v_des_rad_s=qd2_rad_s,
+                        t_ff_nm=tau2_nm,
+                        kp=self.config.motion_kp,
+                        kd=self.config.motion_kd
+                    )
 
-                # Monitoraggio stato (ogni 10 cicli per non sovraccaricare il bus)
+                elif strategy == ControlStrategy.SPEED:
+                    # Velocità pianificata + correzione proporzionale sull'errore posizione
+                    # speed_cmd = qd_planned + Kp * (q_planned - q_actual)
+                    q1_actual_deg = self.motor1.read_multi_turn_angle()
+                    q2_actual_deg = self.motor2.read_multi_turn_angle()
+
+                    kp_corr = self.config.speed_pos_correction_kp
+
+                    err1_deg = q1_deg - q1_actual_deg
+                    err2_deg = q2_deg - q2_actual_deg
+
+                    qd1_dps = np.rad2deg(qd1_rad_s) + kp_corr * err1_deg
+                    qd2_dps = np.rad2deg(qd2_rad_s) + kp_corr * err2_deg
+
+                    self.motor1.speed_control(qd1_dps)
+                    self.motor2.speed_control(qd2_dps)
+
+                elif strategy == ControlStrategy.POSITION:
+                    # Posizione assoluta (può stutterare)
+                    qd1_dps = abs(np.rad2deg(qd1_rad_s))
+                    qd2_dps = abs(np.rad2deg(qd2_rad_s))
+
+                    max_speed1 = max(10, min(int(qd1_dps * 1.5),
+                                             self.config.max_motor_speed_dps))
+                    max_speed2 = max(10, min(int(qd2_dps * 1.5),
+                                             self.config.max_motor_speed_dps))
+
+                    self.motor1.absolute_position_control(q1_deg, max_speed1)
+                    self.motor2.absolute_position_control(q2_deg, max_speed2)
+
+                # --- Monitoraggio stato (ogni 10 cicli) ---
                 if self.config.enable_status_monitoring and point_idx % 10 == 0:
                     s1 = self.motor1.read_status_2()
                     s2 = self.motor2.read_status_2()
 
-                    # Controlli di sicurezza
                     if self.config.enable_safety_checks:
                         if (s1.temperature > self.config.max_motor_temp or
                                 s2.temperature > self.config.max_motor_temp):
@@ -861,7 +1065,6 @@ class TrajectoryController:
                             self.emergency_stop()
                             return
 
-                    # Log
                     self.log_time.append(t_ctrl[point_idx])
                     self.log_q1_cmd.append(q1_deg)
                     self.log_q2_cmd.append(q2_deg)
@@ -970,7 +1173,8 @@ class TrajectoryController:
 
 def run_pick_and_place(dry_run: bool = True, bus_type: str = "can",
                        channel: str = "can0", serial_port: str = "/dev/ttyUSB0",
-                       motor1_id: int = 1, motor2_id: int = 2):
+                       motor1_id: int = 1, motor2_id: int = 2,
+                       strategy: str = "motion_mode"):
     """
     Esegui ciclo completo pick & place: simulazione + controllo motori.
 
@@ -1071,12 +1275,22 @@ def run_pick_and_place(dry_run: bool = True, bus_type: str = "can",
         motor1 = V3Motor(motor1_id, protocol, gear_ratio=params.gear_ratio)
         motor2 = V3Motor(motor2_id, protocol, gear_ratio=params.gear_ratio)
 
+    # Seleziona strategia (RS485 non supporta motion_mode)
+    ctrl_strategy = ControlStrategy(strategy)
+    if ctrl_strategy == ControlStrategy.MOTION_MODE and bus_type == "rs485":
+        print("\n   Motion Mode non disponibile su RS485, uso SPEED")
+        ctrl_strategy = ControlStrategy.SPEED
+
     controller_config = ControllerConfig(
+        strategy=ctrl_strategy,
         control_rate_hz=100.0,
         max_motor_speed_dps=720,
         position_accel_dps2=10000,
         position_decel_dps2=10000,
         comm_timeout_ms=500,
+        motion_kp=50.0,
+        motion_kd=1.5,
+        speed_pos_correction_kp=5.0,
     )
 
     controller = TrajectoryController(motor1, motor2, controller_config)
@@ -1091,7 +1305,7 @@ def run_pick_and_place(dry_run: bool = True, bus_type: str = "can",
     print("  FASE 3: ESECUZIONE TRAIETTORIA")
     print(f"{'='*70}")
 
-    success = controller.execute_trajectory(t, q, qd, cart, blocking=True)
+    success = controller.execute_trajectory(t, q, qd, cart, tau=tau, blocking=True)
 
     if success:
         print(f"\n   Ciclo pick & place completato!")
@@ -1143,6 +1357,11 @@ if __name__ == "__main__":
                         help='ID motore giunto 1 (default: 1)')
     parser.add_argument('--motor2-id', type=int, default=2,
                         help='ID motore giunto 2 (default: 2)')
+    parser.add_argument('--strategy',
+                        choices=['motion_mode', 'speed', 'position'],
+                        default='motion_mode',
+                        help='Strategia controllo: motion_mode (pos+vel+coppia), '
+                             'speed (vel+correzione), position (fallback)')
 
     args = parser.parse_args()
 
@@ -1155,4 +1374,5 @@ if __name__ == "__main__":
         serial_port=args.serial_port,
         motor1_id=args.motor1_id,
         motor2_id=args.motor2_id,
+        strategy=args.strategy,
     )
