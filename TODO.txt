@@ -1,0 +1,2 @@
+scara pick palace python is a path planning for a scara horizontal arm movement.
+I want to implement the planned path trajectory control system for the X-V3 motor type using python
